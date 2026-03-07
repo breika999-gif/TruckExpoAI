@@ -1,0 +1,6 @@
+flask
+flask-cors
+google-genai>=1.0
+openai
+requests
+python-dotenv
