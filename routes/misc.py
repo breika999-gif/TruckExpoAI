@@ -1,7 +1,7 @@
 import os, sys, json, re, requests, time as _cache_time
 from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request
-from config import TOMTOM_API_KEY
+from config import TOMTOM_API_KEY, MAPBOX_PUBLIC_TOKEN
 from database import get_db, row_to_poi, DB_PATH
 from utils.helpers import _is_rate_limited, _get_body, now_iso
 from services.tomtom_service import (
@@ -41,6 +41,7 @@ def health():
         "gpt4o_ready": _gpt4o_ready, 
         "gemini_ready": _gemini_ready, 
         "tomtom_ready": bool(TOMTOM_API_KEY), 
+        "mapbox_ready": bool(MAPBOX_PUBLIC_TOKEN),
         "timestamp": now_iso()
     })
 
