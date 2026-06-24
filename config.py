@@ -3,21 +3,46 @@ import re
 import json
 from dotenv import load_dotenv
 
-# Load .env relative to this file and let repo-local secrets win over stale process env vars.
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+# Load repo-local development secrets without overriding Railway environment variables.
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=False)
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"), override=False)
 
 # ── API Keys & Model Setup ──────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_PROVIDER = os.getenv("OPENAI_PROVIDER", "openai").strip().lower()
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
+OPENAI_MINI_MODEL = os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+AZURE_OPENAI_CHAT_DEPLOYMENT = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "")
+AZURE_OPENAI_MINI_DEPLOYMENT = os.getenv("AZURE_OPENAI_MINI_DEPLOYMENT", AZURE_OPENAI_CHAT_DEPLOYMENT)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY")
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY")
 MAPBOX_PUBLIC_TOKEN = os.getenv("MAPBOX_PUBLIC_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-preview-04-17")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+REDIS_URL = os.getenv("REDIS_URL", "")
+JWT_ACCESS_TTL_MINUTES = int(os.getenv("JWT_ACCESS_TTL_MINUTES", "120"))
+JWT_REFRESH_TTL_DAYS = int(os.getenv("JWT_REFRESH_TTL_DAYS", "30"))
 
 # ── Flask Configuration ─────────────────────────────────────────────────────
 FLASK_PORT = int(os.getenv("PORT", os.getenv("FLASK_PORT", 5050)))
 FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
+# ── EU Regulation (EC) 561/2006 — Hours of Service limits (seconds) ───────────
+# Single source of truth for backend HOS math. Mirrors src/shared/constants/hosRules.ts.
+HOS_CONTINUOUS_DRIVE_LIMIT_S = 16_200   # 4.5 h continuous driving before a break
+HOS_DAILY_DRIVE_LIMIT_S = 32_400        # 9 h standard daily limit
+HOS_DAILY_DRIVE_EXTENDED_S = 36_000     # 10 h extended (max 2×/week)
+HOS_WEEKLY_DRIVE_LIMIT_S = 201_600      # 56 h weekly
+HOS_BIWEEKLY_DRIVE_LIMIT_S = 324_000    # 90 h fortnightly
+HOS_BREAK_FULL_S = 2_700                # 45 min full break (resets continuous counter)
+HOS_BREAK_SPLIT_FIRST_S = 900           # 15 min first part of split break
+HOS_BREAK_SPLIT_SECOND_S = 1_800        # 30 min second part of split break
 
 # ── Truck Routing Constants ─────────────────────────────────────────────────
 # EU/Balkans truck speed limits (km/h) by ISO-3166-1 alpha-3 country code
@@ -64,86 +89,39 @@ _ZAGREB_WP    = [15.9799, 45.8150]
 _SOFIA_BYPASS = [[23.2600, 42.7400], [23.4300, 42.7100]]
 
 # ── AI System Prompts ───────────────────────────────────────────────────────
-_GEMINI_SYSTEM = (
-    "Gemini — AI асистент в TruckAI Pro. Говориш с КАМИОНЕН ШОФЬОР. "
-    "САМО БЪЛГАРСКИ. Кратко и ясно. Обръщай се 'Колега'.\n\n"
-    "ТАХОГРАФ (EU 561/2006):\n"
-    "- Дневно: 9ч (10ч → макс 2×/седм)\n"
-    "- Дневна почивка: 11ч редовна / 9ч намалена (макс 3× между седм. почивки)\n"
-    "- Седмична: 45ч редовна / 24ч намалена (компенсация до 3-та седм.)\n"
-    "- Лимити: 56ч/седм, 90ч/2седм. Пауза: 45мин след 4.5ч (или 15+30)\n"
-    "- При <30мин до лимит → предупреди веднага.\n\n"
-    "МОЖЕ ЛИ ДА СТИГНА: При въпрос 'Мога ли да стигна до X?' изчисли:\n"
-    "  1. Оцени разстоянието в км до X от текущата GPS позиция на шофьора.\n"
-    "  2. Изчисли времето: разстояние / 80 км/ч = часове.\n"
-    "  3. Сравни с 'ефективно-остава' от тахографа.\n"
-    "  4. Ако може → 'Да, колега! ~X км / ~Y ч. Имаш Z ч оставащи.' "
-    "  5. Ако не може → 'Не, колега. X ч до дестинацията, но имаш само Y ч. "
-    "Трябва почивка след ~K км. Предлагам спирка при...'\n\n"
-    "📱 ПРИЛОЖЕНИЯ — добавяй в края:\n"
-    "[APP:{\"app\":\"<name>\",\"query\":\"<опц>\"}]\n"
-    "\nТРАНСПАРКИНГ: При въпрос за паркинг за камиони (TransParking, паркинги на живо, "
-    "свободни места) → добавяй:\n"
-    "[APP:{\"app\":\"chrome\",\"url\":\"https://truckerapps.eu/transparking/pl/map/\"}]\n"
-    "Кажи на шофьора: 'Отварям TransParking за теб, колега.'\n"
-    "## WTD / Работен ден (Working Time Directive EU 2002/15)\n\n"
-    "Получаваш сурови данни от тахографа:\n"
-    "- shift_start_iso: началото на смяната (ISO timestamp) — кога шофьорът е започнал да работи\n"
-    "- reduced_rests_remaining: колко 9-часови (намалени) почивки му остават тази седмица (обичайно 3 на 2 седмици)\n"
-    "- daily_driving_limit_h: дневен лимит каране в часове (9 или 10)\n"
-    "- driven_seconds: изкарани секунди каране днес\n"
-    "- est_km: прогнозни километри до дестинацията\n\n"
-    "Правила (изчисляваш сам):\n"
-    "1. Максимален работен ден = 13ч. Ако reduced_rests_remaining > 0 → може да разпъне до 15ч (с намалена почивка 9ч).\n"
-    "2. Краен час на работния ден = shift_start_iso + (13 или 15)ч\n"
-    "3. Оставащо каране = daily_driving_limit_h * 3600 - driven_seconds\n"
-    "4. Краен час за каране = now + оставащо_каране\n"
-    "5. Шофьорът трябва да спре при по-ранния от двата края (работен ден или каране)\n\n"
-    "При въпроси 'До колко часа?', 'Колко мога още?', 'Стигам ли до X?':\n"
-    "- Дай точен час (напр. 'До 21:15')\n"
-    "- Кажи дали ограничението е от тахографа или от работния ден\n"
-    "- Ако reduced_rests_remaining > 0, предложи опцията за 15ч смяна\n\n"
-    "## Тахограф дневник (tacho_log)\n\n"
-    "Получаваш `tacho_log` — дневен журнал на активностите от BLE тахографа:\n"
-    "- `shift_start`: час на първата активност (HH:MM)\n"
-    "- `current_time`: текущ час\n"
-    "- `total_driven_min`: изкарани минути каране\n"
-    "- `remaining_drive_min`: оставащи минути каране (от тахографа)\n"
-    "- `segments`: списък [{activity, start, end, duration_min}]\n\n"
-    "Активности: DRIVING=каране, REST=почивка, WORK=друга работа, AVAILABILITY=на разположение\n\n"
-    "При въпроси за тахографа ВИНАГИ ползвай tacho_log за точни изчисления:\n"
-    "- Смяна = shift_start + 13ч (или 15ч ако reduced_rests_remaining > 0)\n"
-    "- Следваща задължителна пауза = след 4.5ч непрекъснато каране (проверявай в segments)\n"
-    "- 45мин пауза = може разделена на 15мин + 30мин (в този ред)\n"
-    "- Форматирай отговора с точни часове: 'Трябва да спреш до 18:30'\n\n"
-    "## Седмично тахо (tacho_week)\n\n"
-    "Получаваш `tacho_week` — седмично и двуседмично резюме по EU 561/2006:\n"
-    "- weekly_driven_min / weekly_limit_min (56ч = 3360мин): седмичен лимит\n"
-    "- biweekly_driven_min / biweekly_limit_min (90ч = 5400мин): двуседмичен лимит\n"
-    "- weekly_remaining_min: оставащи минути тази седмица\n"
-    "- daily_breakdown: {дата: часове} за последните 7 дни\n\n"
-    "При въпроси 'Колко мога да карам тази седмица?', 'Имам ли право на повече часове?' — ползвай тези данни.\n"
-    "\n## Потребителска памет (user_memory)\n\n"
-    "Получаваш `user_memory` — масив от предпочитания и факти за шофьора, натрупани от предишни разговори.\n"
-    "Примери: 'Обича да спи в Найт Стар', 'Камионът е Volvo FH 500, Euro 6'\n"
-    "Ползвай тези факти проактивно при препоръки — не питай отново за неща, които вече знаеш.\n"
-    "Когато шофьорът каже нещо ново важно ('обичам X', 'камионът ми е Y'), отговори нормално, "
-    "но в края добави JSON тагове за запомняне: <remember category=\"preference\">текст</remember>\n"
-    "Категории: parking, route, preference, general\n\n"
-    "## Важно правило за контекстни данни\n"
-    "Данните в квадратни скоби [ТАХОГРАФ:...], [ПАМЕТ:...], [gpt_route_data:...], [НАВИЦИ:...] са ВЪТРЕШНИ.\n"
-    "НИКОГА не ги цитирай, не ги повтаряй и не показвай JSON в отговора си.\n"
-    "Ползвай ги само за да формулираш естествен отговор на български.\n\n"
-    "## GPT маршрутни данни (gpt_route_data)\n"
-    "Когато получиш gpt_route_data в контекста, използвай само числата — обясни на шофьора на човешки език.\n"
-    "Пример: 'До Хамбург има около 1240 км, около 13 часа каране без почивки.'\n\n"
-    "## Навици на шофьора (driver_habits)\n"
-    "Статистика от последните 14 дни:\n"
-    "- typical_start: обичайно начало на работния ден\n"
-    "- typical_stop: обичайно спиране\n"
-    "- avg_daily_driven_h: средно часове каране на ден\n\n"
-    "Ползвай тези данни за персонализирани препоръки: 'Обикновено тръгваш в 7:00, но днес е вече 9:00 — имаш ли забавяне?'\n"
+GEMINI_BASE = (
+    "TruckAI асистент за камионджии. САМО БЪЛГАРСКИ. Обръщай се 'Колега'. "
+    "Данните в [...] са вътрешни — не ги цитирай. "
+    "При конкретен паркинг с PARKING_CARDS в контекст → "
+    "[APP:{\"app\":\"transparking\",\"transparking_id\":\"<id от PARKING_CARDS>\"}]. "
+    "При общ въпрос за паркинг → "
+    "[APP:{\"app\":\"transparking\"}]"
 )
+
+GEMINI_TACHO_RULES = (
+    "\nEU 561: 4.5ч каране → 45мин пауза (или 15+30мин). "
+    "Дневно: 9ч (10ч макс 2×/седм). Почивка: 11ч/9ч намалена (макс 3×). "
+    "Седм: 56ч, 2седм: 90ч. При <30мин → предупреди.\n"
+    "WTD: краен=shift_start+(13 или 15ч ако reduced_rests>0)ч. "
+    "Спри при по-ранния от тахо/работен ден.\n"
+    "МАРШРУТ контекст: dist=реално разстояние, ест=реално времетраене, остава=оставащо шофьорско. "
+    "При 'Мога ли до X': сравни ест с остава. Да→'~Xкм/~Yч, имаш Zмин'. Не→'нужна почивка, стигаш след Kкм.'\n"
+    "tacho_log: ползвай remaining_drive_min и segments за точни часове.\n"
+    "tacho_week: weekly_remaining_min за седмичен лимит.\n"
+    "driver_habits: ползвай за персонализирани препоръки."
+)
+
+GEMINI_MEMORY_RULES = (
+    "\nПолзвай user_memory проактивно — не питай повторно за известни факти. "
+    "Ново важно → <remember category=\"preference\">текст</remember>. "
+    "Категории: parking, route, preference, general."
+)
+
+# Compatibility aliases for existing imports. New code should use build_gemini_system().
+_GEMINI_SYSTEM = GEMINI_BASE
+GEMINI_SYSTEM_TACHO = GEMINI_BASE + GEMINI_TACHO_RULES
+GEMINI_SYSTEM_NAV = GEMINI_BASE
+GEMINI_SYSTEM_SHORT = GEMINI_BASE
 
 _SYSTEM_PROMPT = (
     "Ти си TruckAI — GPS асистент за камиони. Отговаряй САМО на български, бъди КРАТЪК, казвай 'Колега'.\n"
@@ -152,12 +130,10 @@ _SYSTEM_PROMPT = (
     "1. APP CONTROL: launch_app при YouTube, Spotify, Google, Chrome и т.н.\n"
     "2. AVOIDANCE: По подразбиране избягвай Сърбия (ползвай Румъния → Букурещ → Клуж → Будапеща). "
     "Поддържай: serbia, romania, tolls, sofia_center, motorway, ferry.\n"
-    "3. SEARCH: search_business за ВСЯКО място — ресторант, сервиз, митница, склад, бензиностанция.\n"
-    "4. CITY SEARCH: 'до/в/около/край' + град = търси около ТОЗИ ГРАД, не около GPS на шофьора. "
-    "Координати: Русе=43.849,25.955|София=42.698,23.321|Варна=43.204,27.910|"
-    "Пловдив=42.150,24.745|Бургас=42.504,27.469|Плевен=43.417,24.607|"
-    "Ст.Загора=42.425,25.634|Шумен=43.271,26.919|В.Търново=43.076,25.617|"
-    "Видин=43.993,22.870|Враца=43.200,23.550\n"
+    "3. SEARCH: search_business за ВСЯКО място — ресторант, сервиз, митница, склад. "
+    "За гориво ползвай find_fuel_stations; за камери ползвай find_speed_cameras.\n"
+    "4. CITY SEARCH: 'до/в/около/край' + град = търси около ТОЗИ ГРАД. "
+    "Ползвай navigate_to(градско_име) — TomTom геокодира автоматично.\n"
     "5. NAVIGATION vs SEARCH: само градско име → navigate_to веднага. "
     "НИКОГА search_business/find_truck_parking за самотно градско име. "
     "Без 'паркинг'/'стоянка' в съобщението — не търси паркинг.\n\n"
@@ -305,6 +281,64 @@ _TOOLS = [
                     "lng":   {"type": "number"},
                 },
                 "required": ["query", "lat", "lng"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_truck_parking",
+            "description": (
+                "Find truck parking lots near a city or coordinates. "
+                "Use when user asks for parking, truck stop, overnight stop, rest area. "
+                "Always geocode city name to lat/lng before calling."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat":      {"type": "number"},
+                    "lng":      {"type": "number"},
+                    "radius_m": {"type": "integer", "default": 5000},
+                },
+                "required": ["lat", "lng"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_fuel_stations",
+            "description": (
+                "Find HGV-friendly fuel stations near coordinates. "
+                "Use for diesel, fuel, gas station, бензиностанция, гориво requests."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat":      {"type": "number"},
+                    "lng":      {"type": "number"},
+                    "radius_m": {"type": "integer", "default": 50000},
+                },
+                "required": ["lat", "lng"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_speed_cameras",
+            "description": (
+                "Find speed cameras near coordinates. "
+                "Use when the driver asks for cameras, radars, speed traps, камери or радари."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat":      {"type": "number"},
+                    "lng":      {"type": "number"},
+                    "radius_m": {"type": "integer", "default": 10000},
+                },
+                "required": ["lat", "lng"],
             },
         },
     },

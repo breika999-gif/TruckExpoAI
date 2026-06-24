@@ -1,10 +1,15 @@
 flask
 flask-cors
+sentry-sdk[flask]>=2.0
 google-genai>=1.0
+google-auth>=2.29.0
 openai
 anthropic
 requests
 python-dotenv
 gunicorn
+PyJWT>=2.8.0
+psycopg2-binary>=2.9.9
+redis>=5.0.0
 
 # 2026-03-29-v4

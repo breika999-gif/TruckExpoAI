@@ -1,15 +1,36 @@
+import os
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
 from flask import Flask
 from flask_cors import CORS
 from config import FLASK_PORT, FLASK_DEBUG
+
+sentry_sdk.init(
+    dsn=os.environ.get('SENTRY_DSN', ''),
+    integrations=[FlaskIntegration()],
+    environment='development' if FLASK_DEBUG else 'production',
+    traces_sample_rate=0.05,
+    send_default_pii=False,
+)
 from database import init_db, start_background_tasks
 from routes.chat import chat_bp
 from routes.gemini import gemini_bp
 from routes.poi import poi_bp
 from routes.tacho import tacho_bp
 from routes.misc import misc_bp
+from routes.auth import auth_bp
+from routes.sentry_webhook import sentry_webhook_bp
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "APP_CORS_ORIGINS",
+        "https://truckexpoai.com,https://www.truckexpoai.com,https://breika999-gif.github.io",
+    ).split(",")
+    if origin.strip()
+]
+CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
 # Register Blueprints
 app.register_blueprint(chat_bp)
@@ -17,12 +38,13 @@ app.register_blueprint(gemini_bp)
 app.register_blueprint(poi_bp)
 app.register_blueprint(tacho_bp)
 app.register_blueprint(misc_bp)
+app.register_blueprint(auth_bp)
+app.register_blueprint(sentry_webhook_bp)
+
+# Initialize DB schema and background tasks (works with both gunicorn and dev server)
+if os.environ.get("WERKZEUG_RUN_MAIN") != "false":
+    init_db()
+    start_background_tasks()
 
 if __name__ == "__main__":
-    # Initialize DB schema
-    init_db()
-    # Start background threads (Transparking cache, etc.)
-    start_background_tasks()
-    
-    # Run Flask
     app.run(host="0.0.0.0", port=FLASK_PORT, debug=FLASK_DEBUG)

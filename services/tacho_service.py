@@ -1,5 +1,15 @@
 from datetime import date, timedelta, datetime as dt
 from database import get_db
+from config import (
+    HOS_CONTINUOUS_DRIVE_LIMIT_S,
+    HOS_DAILY_DRIVE_LIMIT_S,
+    HOS_DAILY_DRIVE_EXTENDED_S,
+    HOS_WEEKLY_DRIVE_LIMIT_S,
+    HOS_BIWEEKLY_DRIVE_LIMIT_S,
+    HOS_BREAK_FULL_S,
+    HOS_BREAK_SPLIT_FIRST_S,
+    HOS_BREAK_SPLIT_SECOND_S,
+)
 
 def _analyze_weekly_rests(user_email: str, week_start: str) -> dict:
     REGULAR_S, REDUCED_S, MAX_REDUCED = 39_600, 32_400, 3
@@ -18,44 +28,57 @@ def _tacho_summary(user_email: str = "") -> dict:
     today_dt = date.today()
     today, week_start = today_dt.isoformat(), (today_dt - timedelta(days=today_dt.weekday())).isoformat()
     prev_week_start = (today_dt - timedelta(days=today_dt.weekday() + 7)).isoformat()
-    DAILY_LIMIT, WEEKLY_LIMIT, BIWEEKLY_LIMIT, CONTINUOUS_LIMIT = 32400, 201600, 324000, 16200
+    DAILY_LIMIT, WEEKLY_LIMIT, BIWEEKLY_LIMIT, CONTINUOUS_LIMIT = (
+        HOS_DAILY_DRIVE_LIMIT_S, HOS_WEEKLY_DRIVE_LIMIT_S, HOS_BIWEEKLY_DRIVE_LIMIT_S, HOS_CONTINUOUS_DRIVE_LIMIT_S
+    )
 
     with get_db() as db:
         daily_s = int(db.execute("SELECT COALESCE(SUM(driven_seconds),0) AS t FROM tacho_sessions WHERE date=? AND user_email=? AND type='driving'", (today, user_email)).fetchone()["t"])
         weekly_s = int(db.execute("SELECT COALESCE(SUM(driven_seconds),0) AS t FROM tacho_sessions WHERE date>=? AND user_email=? AND type='driving'", (week_start, user_email)).fetchone()["t"])
         prev_weekly_s = int(db.execute("SELECT COALESCE(SUM(driven_seconds),0) AS t FROM tacho_sessions WHERE date>=? AND date<? AND user_email=? AND type='driving'", (prev_week_start, week_start, user_email)).fetchone()["t"])
         sessions = db.execute("SELECT type, driven_seconds FROM tacho_sessions WHERE date=? AND user_email=? ORDER BY start_time ASC", (today, user_email)).fetchall()
-        extended_days_used = int(db.execute("""
+        extended_days_used = int(db.execute(f"""
             SELECT COUNT(*) AS cnt FROM (
                 SELECT date FROM tacho_sessions
                 WHERE date >= ? AND date < ? AND user_email = ? AND type='driving'
-                GROUP BY date HAVING SUM(driven_seconds) > 32400
+                GROUP BY date HAVING SUM(driven_seconds) > {HOS_DAILY_DRIVE_LIMIT_S}
             )
         """, (week_start, today, user_email)).fetchone()["cnt"])
 
-    effective_daily_limit_s = 36000 if extended_days_used < 2 else DAILY_LIMIT
+    effective_daily_limit_s = HOS_DAILY_DRIVE_EXTENDED_S if extended_days_used < 2 else DAILY_LIMIT
 
     continuous_s, first_split_done = 0, False
     for sess in sessions:
         if sess["type"] == 'driving': continuous_s += int(sess["driven_seconds"])
         elif sess["type"] in ('break', 'rest'):
             dur = int(sess["driven_seconds"])
-            if dur >= 2700 or (dur >= 1800 and first_split_done): continuous_s, first_split_done = 0, False
-            elif dur >= 900: first_split_done = True
+            if dur >= HOS_BREAK_FULL_S or (dur >= HOS_BREAK_SPLIT_SECOND_S and first_split_done): continuous_s, first_split_done = 0, False
+            elif dur >= HOS_BREAK_SPLIT_FIRST_S: first_split_done = True
 
     rests = _analyze_weekly_rests(user_email, week_start)
+    biweekly_s = weekly_s + prev_weekly_s
     return {
         "daily_driven_s": daily_s, "daily_remaining_s": max(0, effective_daily_limit_s - daily_s),
         "daily_driven_h": round(daily_s/3600, 2), "daily_remaining_h": round(max(0, effective_daily_limit_s - daily_s)/3600, 2),
         "weekly_driven_s": weekly_s, "weekly_remaining_s": max(0, WEEKLY_LIMIT - weekly_s),
         "weekly_driven_h": round(weekly_s/3600, 2), "weekly_remaining_h": round(max(0, WEEKLY_LIMIT - weekly_s)/3600, 2),
+        "continuous_driven_s": continuous_s, "continuous_remaining_s": max(0, CONTINUOUS_LIMIT - continuous_s),
         "continuous_driven_h": round(continuous_s/3600, 2), "continuous_remaining_h": round(max(0, CONTINUOUS_LIMIT - continuous_s)/3600, 2),
-        "break_needed": continuous_s >= CONTINUOUS_LIMIT, "biweekly_driven_h": round((weekly_s + prev_weekly_s)/3600, 2),
-        "reduced_rests_remaining": rests["reduced_rests_remaining"], "daily_limit_h": 10 if extended_days_used < 2 else 9, "weekly_limit_h": 56, "date": today
+        "break_needed": continuous_s >= CONTINUOUS_LIMIT,
+        "biweekly_driven_h": round(biweekly_s/3600, 2),
+        "biweekly_remaining_h": round(max(0, BIWEEKLY_LIMIT - biweekly_s)/3600, 2),
+        "biweekly_limit_h": round(BIWEEKLY_LIMIT / 3600, 2),
+        "weekly_regular_rests": rests["weekly_regular_rests"],
+        "weekly_reduced_rests": rests["weekly_reduced_rests"],
+        "reduced_rests_remaining": rests["reduced_rests_remaining"],
+        "daily_limit_h": 10 if extended_days_used < 2 else 9,
+        "weekly_limit_h": 56,
+        "date": today,
+        "week_start": week_start
     }
 
 def _tool_calculate_hos_reach(driven_seconds: int, speed_kmh: float, user_email: str = "") -> dict:
     summary = _tacho_summary(user_email)
-    remaining_s = min(max(0, 16200 - driven_seconds), summary["daily_remaining_s"])
+    remaining_s = min(max(0, HOS_CONTINUOUS_DRIVE_LIMIT_S - driven_seconds), summary["daily_remaining_s"])
     h, m = divmod(int(remaining_s), 3600)
     return {"remaining_h": h, "remaining_min": m // 60, "remaining_km": round((remaining_s / 3600) * speed_kmh), "break_needed": remaining_s <= 0, "daily_remaining_h": summary["daily_remaining_h"], "weekly_remaining_h": summary["weekly_remaining_h"]}

@@ -4,16 +4,23 @@ import json
 import time
 import math
 import hashlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from config import (
     TOMTOM_API_KEY, MAPBOX_PUBLIC_TOKEN, _BUCHAREST_WP, _CLUJ_WP, _BUDAPEST_WP,
     _BELGRADE_WP, _ZAGREB_WP, _SOFIA_BYPASS
 )
 from utils.helpers import _haversine_m, now_iso
+from utils.redis_client import get_redis
 
 _tomtom_ready = bool(TOMTOM_API_KEY)
 _match_cache: dict = {}
-_MATCH_CACHE_TTL_S = 300
+_match_cache_lock = threading.Lock()
+_MATCH_MEMORY_MAX = 500
+_MATCH_CACHE_TTL_S = 180 * 86400  # snapped geometry is stable enough to reuse long-term
+_MATCH_CACHE_PREFIX = "route_match:"
+_SEARCH_CACHE_TTL_S = 30 * 86400
+_NEGATIVE_CACHE_TTL_S = 3600
 
 _TT_MANEUVER_DIR = {
     "TURN_LEFT":        "left",
@@ -90,19 +97,51 @@ def _match_cache_key(coords: list, edge_only_m: int = 0) -> str:
 def _match_cache_get(key: str):
     if not key:
         return None
-    cached = _match_cache.get(key)
-    if not cached:
-        return None
-    ts, value = cached
-    if time.time() - ts > _MATCH_CACHE_TTL_S:
-        _match_cache.pop(key, None)
-        return None
-    print(f"[ROUTING] mapbox match cache hit key={key[:8]}", flush=True)
-    return value
+    with _match_cache_lock:
+        cached = _match_cache.get(key)
+        if cached:
+            ts, value = cached
+            if time.time() - ts <= _MATCH_CACHE_TTL_S:
+                print(f"[ROUTING] mapbox match memory cache hit key={key[:8]}", flush=True)
+                return value
+            _match_cache.pop(key, None)
+
+    try:
+        client = get_redis()
+        if client is not None:
+            raw = client.get(f"{_MATCH_CACHE_PREFIX}{key}")
+            if raw:
+                payload = json.loads(raw)
+                value = (payload["geometry"], bool(payload["success"]))
+                with _match_cache_lock:
+                    if len(_match_cache) >= _MATCH_MEMORY_MAX:
+                        oldest = min(_match_cache, key=lambda k: _match_cache[k][0])
+                        _match_cache.pop(oldest, None)
+                    _match_cache[key] = (time.time(), value)
+                print(f"[ROUTING] mapbox match redis cache hit key={key[:8]}", flush=True)
+                return value
+    except Exception:
+        pass
+
+    return None
 
 def _match_cache_set(key: str, value):
     if key:
-        _match_cache[key] = (time.time(), value)
+        with _match_cache_lock:
+            if len(_match_cache) >= _MATCH_MEMORY_MAX:
+                oldest = min(_match_cache, key=lambda k: _match_cache[k][0])
+                _match_cache.pop(oldest, None)
+            _match_cache[key] = (time.time(), value)
+        try:
+            client = get_redis()
+            if client is not None:
+                client.setex(
+                    f"{_MATCH_CACHE_PREFIX}{key}",
+                    _MATCH_CACHE_TTL_S,
+                    json.dumps({"geometry": value[0], "success": bool(value[1])}),
+                )
+        except Exception:
+            pass
 
 def _split_edge_segments(coords: list, edge_m: int) -> tuple[list, list, list]:
     if len(coords) < 2 or edge_m <= 0:
@@ -201,6 +240,10 @@ def _find_openlr_code(payload) -> str | None:
 def _mapbox_openlr_match(openlr_code: str) -> dict | None:
     if not MAPBOX_PUBLIC_TOKEN or not openlr_code:
         return None
+    cache_key = "openlr:" + hashlib.sha1(openlr_code.encode("utf-8")).hexdigest()
+    cached = _match_cache_get(cache_key)
+    if cached is not None:
+        return cached[0]
     try:
         r = requests.get(
             f"https://api.mapbox.com/matching/v5/mapbox/driving/{requests.utils.quote(openlr_code, safe='')}",
@@ -218,42 +261,11 @@ def _mapbox_openlr_match(openlr_code: str) -> dict | None:
         if data.get("code") == "Ok" and data.get("matchings"):
             geometry = data["matchings"][0].get("geometry")
             if geometry and len(geometry.get("coordinates", [])) >= 2:
+                _match_cache_set(cache_key, (geometry, True))
                 return geometry
     except Exception as exc:
         print(f"[ROUTING] openlr match failed: {exc}", flush=True)
     return None
-
-def _tomtom_snap_to_roads(geometry: dict, vehicle_type: str = "Truck") -> tuple[dict, bool]:
-    coords = geometry.get("coordinates", [])
-    if not _tomtom_ready or len(coords) < 2:
-        return geometry, False
-    sampled = _sample_coords_for_snap(coords)
-    body = {
-        "points": [
-            {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": coord},
-                "properties": {},
-            }
-            for coord in sampled
-        ]
-    }
-    params = {
-        "key": TOMTOM_API_KEY,
-        "fields": "{route{type,geometry{type,coordinates}}}",
-        "vehicleType": vehicle_type,
-        "measurementSystem": "metric",
-        "offroadMargin": 20,
-    }
-    try:
-        r = requests.post("https://api.tomtom.com/snapToRoads/1", params=params, json=body, timeout=12)
-        r.raise_for_status()
-        snapped = _flat_route_coords(r.json().get("route", []))
-        if len(snapped) >= 2:
-            return {"type": "LineString", "coordinates": snapped}, True
-    except Exception:
-        pass
-    return geometry, False
 
 def _mapbox_match_geometry(geometry: dict, edge_only_m: int = 0) -> tuple[dict, bool]:
     """Snap TomTom geometry to Mapbox road network using Map Matching API.
@@ -283,7 +295,10 @@ def _mapbox_match_geometry(geometry: dict, edge_only_m: int = 0) -> tuple[dict, 
             )
             any_matched = first_ok or last_ok
         else:
-            all_snapped, any_matched = _match_coordinate_chunks(coords)
+            # Full-route matching keeps the rendered polyline on Mapbox roads.
+            # Sampling bounds the number of matching requests on long haul routes.
+            sampled = _sample_coords_for_snap(coords, max_points=600)
+            all_snapped, any_matched = _match_coordinate_chunks(sampled)
 
         if len(all_snapped) >= 2:
             result = ({"type": "LineString", "coordinates": all_snapped}, any_matched)
@@ -297,6 +312,17 @@ def _mapbox_match_geometry(geometry: dict, edge_only_m: int = 0) -> tuple[dict, 
 
 def _tomtom_search(query: str, lat: float, lng: float, limit: int = 6) -> list:
     if not _tomtom_ready: return []
+    _lat_r = round(float(lat or 0), 1)
+    _lng_r = round(float(lng or 0), 1)
+    _rk = "geo:tts:" + hashlib.sha256(f"{query.lower().strip()}:{_lat_r}:{_lng_r}:{limit}".encode("utf-8")).hexdigest()
+    _rc = get_redis()
+    if _rc:
+        try:
+            raw = _rc.get(_rk)
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
     try:
         url = f"https://api.tomtom.com/search/2/search/{requests.utils.quote(query)}.json"
         params = {"key": TOMTOM_API_KEY, "limit": limit}
@@ -313,6 +339,11 @@ def _tomtom_search(query: str, lat: float, lng: float, limit: int = 6) -> list:
             if item_lat is None: continue
             name = (item.get("poi") or {}).get("name") or item.get("address", {}).get("freeformAddress", "")
             results.append({"name": name, "address": item.get("address", {}).get("freeformAddress", ""), "lat": item_lat, "lng": item_lng, "distance_m": round(_haversine_m(lat, lng, item_lat, item_lng)) if lat else 0})
+        if _rc:
+            try:
+                _rc.setex(_rk, _NEGATIVE_CACHE_TTL_S if not results else _SEARCH_CACHE_TTL_S, json.dumps(results, default=str))
+            except Exception:
+                pass
         return results
     except Exception: return []
 
@@ -331,7 +362,9 @@ def _get_avoidance_waypoints(origin_lat, origin_lng, dest_lng: float, avoid: lis
 def _tomtom_congestion_geojson(route: dict, geometry: dict) -> dict:
     coords = geometry.get("coordinates", [])
     sections = [s for s in route.get("sections", []) if s.get("sectionType") == "TRAFFIC"]
-    if not sections or len(coords) < 2:
+    if len(coords) < 3:
+        return {"type": "FeatureCollection", "features": []}
+    if not sections:
         return {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"congestion": "unknown"}, "geometry": geometry}]}
     _level = {"JAM": "heavy", "ROAD_WORK": "moderate", "ROAD_CLOSURE": "severe"}
     features = []
@@ -340,7 +373,7 @@ def _tomtom_congestion_geojson(route: dict, geometry: dict) -> dict:
         end   = min(sec.get("endPointIndex", start + 1) + 1, len(coords))
         level = _level.get(sec.get("simpleCategory", ""), "low")
         seg   = coords[start:end]
-        if len(seg) >= 2:
+        if len(seg) >= 3:
             features.append({"type": "Feature", "properties": {"congestion": level}, "geometry": {"type": "LineString", "coordinates": seg}})
     if not features: features = [{"type": "Feature", "properties": {"congestion": "low"}, "geometry": geometry}]
     return {"type": "FeatureCollection", "features": features}
@@ -379,7 +412,27 @@ def _tomtom_speed_limits(route: dict) -> list:
         speed_kmh = round(value * 1.609) if unit in ("MPH", "mph") else int(value)
         start, end = sec.get("startPointIndex", 0), sec.get("endPointIndex", total_pts - 1)
         for i in range(start, min(end + 1, total_pts)): speeds[i] = speed_kmh
-    return [{"speed": s, "unit": "km/h"} if s is not None else {"unknown": True} for s in speeds]
+    # Forward-fill: propagate last known limit into unknown segments
+    last = None
+    for i in range(len(speeds)):
+        if speeds[i] is not None:
+            last = speeds[i]
+        elif last is not None:
+            speeds[i] = last
+    # Backward-fill: fill leading Nones using first known value
+    first = next((s for s in speeds if s is not None), None)
+    if first is not None:
+        for i in range(len(speeds)):
+            if speeds[i] is None:
+                speeds[i] = first
+            else:
+                break
+    # EU HGV cap fallback (90 km/h) when TomTom has no data at all
+    HGV_EU_CAP = 90
+    return [
+        {"speed": s, "unit": "km/h"} if s is not None else {"speed": HGV_EU_CAP, "unit": "km/h", "fallback": True}
+        for s in speeds
+    ]
 
 def _tomtom_lane_banner(instr: dict) -> dict | None:
     lg, msg = instr.get("laneGuidance"), instr.get("message", "")

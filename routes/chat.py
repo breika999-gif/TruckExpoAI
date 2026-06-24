@@ -1,16 +1,18 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
+from utils.auth import require_auth
 from utils.helpers import _is_rate_limited, _get_body
 from services.gpt_service import _run_gpt4o_internal
 
 chat_bp = Blueprint('chat', __name__)
 
 @chat_bp.post("/api/chat")
+@require_auth
 def chat():
     if _is_rate_limited(limit=20, window_s=60):
         return jsonify({"ok": False, "error": "Твърде много заявки. Изчакай минута."}), 429
     body = _get_body()
     user_msg = (body.get("message") or "").strip()
-    user_email = (body.get("user_email") or "").strip()
+    user_email = g.user_email
     if not user_msg:
         return jsonify({"ok": False, "error": "message is required"}), 400
     result = _run_gpt4o_internal(
